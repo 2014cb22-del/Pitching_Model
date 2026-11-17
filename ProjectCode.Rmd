@@ -1,0 +1,171 @@
+---
+title: "Project Code ML"
+output:
+  pdf_document: default
+  html_document: default
+date: "2026-04-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r,message=F}
+library(tidyverse)
+bballdata <- read.csv('ProjectData.csv')
+bballdata <- bballdata %>% drop_na() %>% select(-c(player_id,year,xba,xslg,babip,launch_angle_avg,offspeed_avg_spin,flyballs_percent))
+```
+
+
+```{r}
+#Multicollinearity Plot
+library(corrplot)
+corrplot(cor(bballdata[,-c(1,4)]),tl.cex=0.7)
+```
+
+
+```{r}
+set.seed(1)
+
+index1 <- sample(1:nrow(bballdata), round(0.8*nrow(bballdata)))
+train_data <- bballdata[index1, ]
+test_data <- bballdata[-index1, ]
+```
+
+
+```{r}
+library(glmnet)
+X <- train_data %>% select(-c(last_name..first_name, p_era)) %>% as.matrix()
+X_scaled <- scale(X)
+y <- train_data$p_era
+
+cv_ridge <- cv.glmnet(X_scaled, y, alpha = 0)
+plot(cv_ridge)
+```
+
+```{r}
+best_lambda <- cv_ridge$lambda.min
+ridge_coeffs <- coef(cv_ridge, s = "lambda.min")
+coeff_df <- data.frame(Feature = rownames(ridge_coeffs),Coefficient = as.vector(ridge_coeffs)) %>% arrange(desc(abs(Coefficient)))
+
+print(coeff_df)
+predictions <- predict(cv_ridge, s = best_lambda, newx = X_scaled)
+residuals <- y - predictions
+plot(predictions, residuals,main = "Residuals vs Fitted (Ridge)",xlab = "Predicted ERA (yhat)",ylab = "Residuals")
+abline(h = 0, lty = 2, col = "red")
+```
+
+```{r}
+X_test_matrix <- test_data %>% select(-c(last_name..first_name, p_era)) %>% as.matrix()
+train_mean <- attr(X_scaled, "scaled:center")
+train_sd <- attr(X_scaled, "scaled:scale")
+X_test_scaled <- scale(X_test_matrix, center = train_mean, scale = train_sd)
+```
+
+```{r}
+predictions <- predict(cv_ridge, newx = X_test_scaled, s = "lambda.min")
+y_test <- test_data$p_era
+residuals <- y_test - predictions
+mse <- mean(residuals^2)
+print(paste("MSE:", mse))
+rmse <- sqrt(mse)
+print(paste("RMSE:", rmse))
+```
+
+```{r}
+clean_labels <- c( #allows for variable names in plot to not be raw variable name
+  "barrel_batted_rate"= "Barrel Rate (%)",
+  "k_percent"= "Strikeout Rate (%)",
+  "bb_percent"= "Walk Rate (%)",
+  "hard_hit_percent"= "Hard Hit Rate (%)",
+  "linedrives_percent" = "Line Drive Rate (%)",
+  "offdiff" = "Fastball-Offspeed Velocity Gap",
+  "whiff_percent"= "Whiff Rate (%)",
+  "groundballs_percent"= "Groundball Rate (%)",
+  "exit_velocity_avg"= "Avg Exit Velocity (mph)"
+)
+
+plot_data <- coeff_df %>% filter(Feature != "(Intercept)") %>% head(5) %>%
+  mutate(CleanFeature = ifelse(Feature %in% names(clean_labels), clean_labels[Feature],Feature)) 
+
+ggplot(plot_data, aes(x = reorder(CleanFeature, abs(Coefficient)),y=Coefficient, fill=Coefficient >0)) +
+  geom_col() + coord_flip() + 
+  scale_fill_manual(values = c("FALSE" = "blue", "TRUE" = "red"), 
+                    labels = c("Reduces ERA (Better)", "Increases ERA (Worse)"),name="Impact on Pitcher Performance") +
+  labs(title="Key Drivers of ERA According to Ridge Model",subtitle ="Top 5 Predictors identified from Ridge Regression",
+    x ="Variable",y ="Coefficient") +theme_minimal() +theme(legend.position = "bottom")
+```
+
+
+```{r}
+library(gbm)
+gbm_model <- gbm(formula = p_era ~ .-last_name..first_name,interaction.depth=1,shrinkage=0.001,data = train_data,
+  distribution = "gaussian",n.trees = 10000,cv.folds = 10)
+best_iter <- gbm.perf(gbm_model,method ="cv")
+```
+
+
+```{r}
+gbm_imp <- summary(gbm_model, n.trees = best_iter)
+gbm_imp$var <- as.character(gbm_imp$var)
+gbm_imp$var[gbm_imp$var == "barrel_batted_rate"] <- "Barrel Rate (%)"
+gbm_imp$var[gbm_imp$var == "k_percent"] <- "Strikeout Rate (%)"
+gbm_imp$var[gbm_imp$var == "bb_percent"]<- "Walk Rate (%)"
+gbm_imp$var[gbm_imp$var == "hard_hit_percent"]<- "Hard Hit Rate (%)"
+gbm_imp$var[gbm_imp$var == "offdiff"]<- "Velocity Gap (FB-OS)"
+gbm_imp$var[gbm_imp$var == "linedrives_percent"] <- "Line Drive Rate (%)"
+gbm_imp$var[gbm_imp$var == "offspeed_avg_break"] <- "Offspeed Average Break (inches)"
+gbm_imp$var[gbm_imp$var == "out_zone_percent"] <- "Out of Zone Rate (%)"
+gbm_imp$var[gbm_imp$var == "offspeed_avg_speed"] <- "Offspeed Average Velocity (mph)"
+gbm_imp$var[gbm_imp$var == "whiff_percent"] <- "Whiff Rate (%)"
+gbm_imp$var[gbm_imp$var == "fastball_avg_break_z_induced"] <- "Fastball Average Induced Break"
+gbm_imp$var[gbm_imp$var == "fastball_avg_spin"] <- "Fastball Average Spin (rpm)"
+top_10_imp <- gbm_imp[1:10, ]
+top_10_imp <- top_10_imp[rev(rownames(top_10_imp)), ] 
+par(mar = c(5, 10,2,1)) 
+barplot(top_10_imp$rel.inf,names.arg = top_10_imp$var,las=2,col = "blue",main = "Top 10 Relative Influence from GBM Model",
+        horiz = TRUE,cex.names = 0.6,xlab = "Relative Influence (%)")
+
+gbm_preds <- predict(gbm_model, newdata = test_data, n.trees = best_iter)
+
+gbm_mse <- mean((test_data$p_era - gbm_preds)^2)
+print(paste("MSE:", gbm_mse))
+```
+
+
+
+
+
+```{r}
+results1 <- test_data %>% select(last_name..first_name,p_era) %>% mutate(gbm_pred=gbm_preds,ridge_pred=predictions)
+```
+
+```{r}
+library(randomForest)
+rf_model <- randomForest(p_era ~ . - last_name..first_name, data = train_data,importance = TRUE)
+
+rf_preds <- predict(rf_model, newdata = test_data)
+rf_mse <- mean((test_data$p_era - rf_preds)^2)
+print(paste("MSE:", rf_mse))
+```
+
+
+
+
+```{r}
+#Plot to Make ERA vs Barrel rate with LOESS smoother
+ggplot(bballdata, aes(x = barrel_batted_rate,y =p_era))+ geom_point(alpha = 0.5, color="steelblue") +
+  geom_smooth(method="loess",formula=y ~ x, color = "darkred", fill ="lightgray") +
+  labs(title = "ERA vs Barrel Rate",x ="Barrel Rate (%)",y ="Earned Run Average (ERA)") +theme_minimal() 
+```
+
+```{r}
+train_gbm_preds <- predict(gbm_model, newdata = train_data, n.trees = best_iter)
+
+train_gbm_mse <- mean((train_data$p_era - train_gbm_preds)^2)
+print(paste("MSE:", train_gbm_mse))
+```
+
+
